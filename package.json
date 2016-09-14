@@ -1,0 +1,26 @@
+{
+  "name": "atarijs-sio",
+  "version": "1.0.0",
+  "description": "Atari 8-bit computer SIO library",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "Atari",
+    "SIO",
+    "disk",
+    "drive",
+    "image"
+  ],
+  "author": "Bryan Nielsen (@bnielsen1965)",
+  "license": "MIT",
+  "dependencies": {
+    "serialport": "^4.0.1",
+    "atari-disk-image": "https://github.com/bnielsen1965/atarijs-disk-image.git"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/bnielsen1965/atarijs-sio.git"
+  }
+}
