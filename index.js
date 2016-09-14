@@ -7,7 +7,7 @@ module.exports = createApplication;
  * @return {object} The module instance.
  */
 function createApplication(serialDevice) {
-  var DiskImage = require('atari-disk-image');
+  var DiskImage = require('atarijs-disk-image');
   var SerialPort = require("serialport");
 
 
