@@ -40,6 +40,7 @@ function createApplication(serialDevice) {
   var DELAY_GETSECTOR_DATA      = 400;
   var DELAY_GETSECTOR_DONE      = 200;
 
+  var MAXIMUM_DRIVES = 8;
   var drives = [];
 
   var readState = STATE_WAIT_CMD;
@@ -388,9 +389,36 @@ function createApplication(serialDevice) {
   };
 
 
+
+
   app.loadDrive = function loadDrive(drive, imagePath) {
+    if (drive + 1 > MAXIMUM_DRIVES || drive < 0) {
+      return ['Invalid drive number.'];
+    }
+
     drives[drive] = DiskImage(imagePath);
+
+    return null;
   };
+
+  app.getStatus = function() {
+    var status = {
+      drives: []
+    };
+
+    for (var i = 0; i < MAXIMUM_DRIVES; i++) {
+      status.drives[i] = {};
+      if (drives[i]) {
+        status.drives[i].filename = drives[i].getImageFilename();
+        status.drives[i].sectorCount = drives[i].getSectorCount();
+        status.drives[i].sectorSize = drives[i].getSectorSize(status.drives[i].sectorCount); // boot sectors may be smaller so use last sector
+        status.drives[i].readOnly = drives[i].isReadOnly();
+      }
+    }
+
+    return status;
+  };
+
 
 
   return app;
