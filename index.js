@@ -392,6 +392,7 @@ function createApplication(serialDevice) {
 
 
   app.loadDrive = function loadDrive(drive, imagePath) {
+    // CHANGE THIS TO THROW AN ERROR
     if (drive + 1 > MAXIMUM_DRIVES || drive < 0) {
       return ['Invalid drive number.'];
     }
@@ -400,6 +401,7 @@ function createApplication(serialDevice) {
 
     return null;
   };
+
 
   app.getStatus = function() {
     var status = {
@@ -417,6 +419,50 @@ function createApplication(serialDevice) {
     }
 
     return status;
+  };
+
+
+  app.exportImage = function(drive) {
+    if (drive + 1 > MAXIMUM_DRIVES || drive < 0) {
+      throw new Error('Invalid drive number.');
+    }
+
+    if (!drives[drive]) {
+      throw new Error('No drive image.');
+    }
+
+    return drives[drive].exportImage();
+  };
+
+
+  app.importImage = function(drive, image, filePath) {
+    if (drive + 1 > MAXIMUM_DRIVES || drive < 0) {
+      throw new Error('Invalid drive number.');
+    }
+
+    drives[drive].importImage(image, filePath);
+  };
+
+
+  app.saveImage = function(drive) {
+    if (drive + 1 > MAXIMUM_DRIVES || drive < 0) {
+      throw new Error('Invalid drive number.');
+    }
+
+    if (!drives[drive]) {
+      throw new Error('No drive image.');
+    }
+
+    drives[drive].saveImage();
+  };
+
+
+  app.unloadImage = function(drive) {
+    if (drive + 1 > MAXIMUM_DRIVES || drive < 0) {
+      throw new Error('Invalid drive number.');
+    }
+    drives[drive].unloadImage(drive);
+    drives[drive] = null;
   };
 
 
