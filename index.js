@@ -440,11 +440,15 @@ function createApplication(serialDevice) {
       throw new Error('Invalid drive number.');
     }
 
+    if (!drives[drive]) {
+      drives[drive] = DiskImage();
+    }
+
     drives[drive].importImage(image, filePath);
   };
 
 
-  app.saveImage = function(drive) {
+  app.saveImage = function(drive, filePath) {
     if (drive + 1 > MAXIMUM_DRIVES || drive < 0) {
       throw new Error('Invalid drive number.');
     }
@@ -453,7 +457,7 @@ function createApplication(serialDevice) {
       throw new Error('No drive image.');
     }
 
-    drives[drive].saveImage();
+    drives[drive].saveImage(filePath);
   };
 
 
