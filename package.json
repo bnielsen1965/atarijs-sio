@@ -16,7 +16,7 @@
   "author": "Bryan Nielsen (@bnielsen1965)",
   "license": "MIT",
   "dependencies": {
-    "serialport": "^4.0.1",
+    "serialport": "^9.0.7",
     "atari-disk-image": "https://github.com/bnielsen1965/atarijs-disk-image.git"
   },
   "repository": {
