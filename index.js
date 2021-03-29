@@ -1,475 +1,378 @@
-// diskimage.js
+const EventEmitter = require('events');
+const DiskImage = require('atarijs-disk-image');
+const SerialPort = require("serialport");
 
-module.exports = createApplication;
+const MAX_DATA_DELAY = 10000000;
+const ABORT_DELAY = 1000000000;
+const MAXIMUM_DRIVES = 8;
 
-/**
- * Create module instance.
- * @return {object} The module instance.
- */
-function createApplication(serialDevice) {
-  var DiskImage = require('atarijs-disk-image');
-  var SerialPort = require("serialport");
+const DELAY_GETSECTOR_ACK       = 1000;
+const DELAY_GETSECTOR_COMPLETE  = 200;
+const DELAY_GETSECTOR_DATA      = 400;
+const DELAY_GETSECTOR_DONE      = 200;
 
+const States = {
+  WAIT_CMD: 1,
+  PROCESS_CMD: 2,
+  WAIT_SECTOR_DATA: 3,
+  PROCESS_DATA: 4
+};
 
-  var app = function() {};
+const Commands = {
+  FORMAT: 0x21,
+  FORMAT_MD: 0x22,
+  POLL: 0x3F,
+  WRITE: 0x50,
+  READ: 0x52,
+  STATUS: 0x53,
+  WRITE_VERIFY: 0x57
+};
 
-  // delay between last byte and next that is needed to start new command frame
-  var START_DELAY = 10000000;
-  var ABORT_DELAY = 1000000000;
+const Responses = {
+  ACK: 0x41,
+  NAK: 0x4e,
+  COMPLETE: 0x43,
+  ERR: 0x45
+};
 
-  var STATE_WAIT_CMD      = 1;
-  var STATE_PROCESS_CMD   = 2;
-  var STATE_READ_DATA     = 3;
-  var STATE_PROCESS_DATA  = 4;
-
-  var SIO_ACK       = 0x41;
-  var SIO_NAK       = 0x4e;
-  var SIO_COMPLETE  = 0x43;
-  var SIO_ERR       = 0x45;
-
-  var CMD_FORMAT           = 0x21;
-  var CMD_FORMAT_MD        = 0x22;
-  var CMD_POLL             = 0x3F;
-  var CMD_WRITE            = 0x50;
-  var CMD_READ             = 0x52;
-  var CMD_STATUS           = 0x53;
-  var CMD_WRITE_VERIFY     = 0x57;
-
-  var DELAY_GETSECTOR_ACK       = 1000;
-  var DELAY_GETSECTOR_COMPLETE  = 200;
-  var DELAY_GETSECTOR_DATA      = 400;
-  var DELAY_GETSECTOR_DONE      = 200;
-
-  var MAXIMUM_DRIVES = 8;
-  var drives = [];
-
-  var readState = STATE_WAIT_CMD;
-  var readBlock = null;
-  var readHRTime = null;
-  var writeHRTime = null;
-  var writing = false;
-  var readDataLength = null;
-  var readDataCallback = null;
-
-  var commandFrame = {
-    deviceId: null,
-    command: null,
-    aux1: null,
-    aux2: null,
-    checksum: null
-  };
-
-  var port = new SerialPort(serialDevice, {
+const Defaults = {
+  serialPort: {
     baudRate: 19200,
     bufferSize: 1
-  });
+  }
+};
+
+// class to control SIO interface
+class SIO extends EventEmitter {
+  constructor (serialDevice, settings) {
+    super();
+    this.settings = Object.assign({}, Defaults, settings);
+    this.settings.serialPort = Object.assign({}, Defaults.serialPort, this.settings.serialPort);
+    this.dataBlock = null;
+    this.state = States.WAIT_CMD;
+    this.lastHRTime = this.getHRTime();
+    this.writing = false;
+    this.writeSectorCommandFrame;
+    this.drives = {};
+    this.serialPortSetup(serialDevice);
+  }
+
+  serialPortSetup (serialDevice) {
+    let _this = this;
+    console.log(serialDevice, this.settings.serialPort)
+    this.port = new SerialPort(serialDevice, this.settings.serialPort);
+    // open errors will be emitted as an error event
+    this.port.on('error', this.onSerialPortError.bind(this));
+    this.port.on('data', this.onSerialPortData.bind(this));
+  }
+
+  onSerialPortError (error) {
+    this.emit('error', `Serial port error, ${error.message}.`);
+  }
+
+  // event handler for incoming SIO data
+  async onSerialPortData (data) {
+    let previousHRTime = this.lastHRTime;
+    this.lastHRTime = this.getHRTime();
 
 
-  // open errors will be emitted as an error event
-  port.on('error', function(err) {
-    console.log('Error: ', err.message);
-  });
+    switch (this.state) {
+      // waiting for command frame
+      case States.WAIT_CMD:
+        // waiting on command frame
+        console.log('STATE_WAIT_CMD')
+        if (this.lastHRTime - previousHRTime > MAX_DATA_DELAY) {
+          console.log('RESET DATA BLOCK')
+          this.dataBlock = null;
+        }
+        this.dataBlock = this.dataBlock ? Buffer.concat([this.dataBlock, data], this.dataBlock.length + data.length) : data;
+        // check if enough bytes for a command frame
+        if (this.dataBlock.length < 5) return;
+        if (this.dataBlock.length > 5) {
+          // nak?
+          this.dataBlock = null;
+          return;
+        }
+        this.state = States.PROCESS_CMD;
+        try {
+          this.state = await this.processCommandFrame(this.dataToCommandFrame(this.dataBlock));
+        }
+        catch (error) {
+          this.emit('error', `Failed to process command frame. ${error.message}`);
+          this.state = States.WAIT_CMD;
+        }
+        break;
 
+      case States.PROCESS_CMD:
+        console.log('STATE_PROCESS_CMD')
+        if (this.lastHRTime - previousHRTime > MAX_DATA_DELAY) {
+          console.log('RESET DATA BLOCK')
+          // TODO nak? reset state?
+          this.dataBlock = null;
+          this.state = States.WAIT_CMD;
+        }
+        break;
 
-  // read data from serial port
-  port.on('data', function (data) {
-    // determine the delay since the last read
-    var newHRTime = getHRTime();
+      // waiting to receive sector data for a disk write command
+      case States.WAIT_SECTOR_DATA:
+        // read data for in progress write sector command
+        console.log('STATE_WAIT_SECTOR_DATA')
+        if (this.lastHRTime - previousHRTime > ABORT_DELAY) {
+          console.log('RESET DATA BLOCK')
+          // nak? reset state?
+          this.dataBlock = null;
+        }
+        this.dataBlock = this.dataBlock ? Buffer.concat([this.dataBlock, data], this.dataBlock.length + data.length) : data;
+        // if we have enough data for a block then process
+        if (this.dataBlock.length < this.writeSectorCommandFrame.dataLength) return;
+        this.state = States.PROCESS_DATA;
+        try {
+          await this.processSectorData(this.dataBlock, this.writeSectorCommandFrame);
+        }
+        catch (error) {
+          this.emit('error', `Failed to process sector write data frame. ${error.message}`);
+        }
+        this.state = States.WAIT_CMD;
+        break;
 
-    switch (readState) {
-      case STATE_WAIT_CMD:
-      readCommand(data, newHRTime - readHRTime);
-      // note the time of this read
-      readHRTime = newHRTime;
-      break;
-
-      case STATE_PROCESS_CMD:
-      readHRTime = newHRTime;
-      break;
-
-      case STATE_READ_DATA:
-      readData(data);
-      readHRTime = newHRTime;
-      break;
-
-      case STATE_PROCESS_DATA:
-      console.log('UNEXPECTED: ' + data.toString('hex'));
-      break;
+      case States.PROCESS_DATA:
+        console.log('STATE_PROCESS_DATA')
+        console.log('UNEXPECTED: ' + data.toString('hex'));
+        break;
 
       default:
-      if (newHRTime - readHRTime > ABORT_DELAY) {
-        console.log('ABORT');
-        readState = STATE_WAIT_CMD;
-      }
-      break;
+        console.log('STATE DEFAULT')
+        if (this.lastHRTime - previousHRTime > MAX_DATA_DELAY) {
+          console.log('ABORT')
+          this.state = States.WAIT_CMD;
+        }
+        break;
     }
 
-  });
+    this.dataBlock = null;
+  }
 
-
-  var readCommand = function readCommand(readData, delayHRTime) {
-    if (delayHRTime > START_DELAY || !readBlock) {
-      readBlock = readData;
+  // convert 5 bytes of data to command frame
+  dataToCommandFrame (data) {
+    if (this.checksum(data, 4) !== data[4]) throw new Error('Checksum error in command frame.');
+    return {
+      driveNumber: data[0] & 0xf,
+      deviceId: data[0],
+      command: data[1],
+      aux1: data[2],
+      aux2: data[3],
+      checksum: data[4]
     }
-    else {
-      // append byte to current block
-      readBlock = Buffer.concat([readBlock, readData], readBlock.length + readData.length);
-    }
+  }
 
-    // if we have enough data for a block then process
-    if (readBlock.length === 5) {
-      if (bufferToCommandFrame(readBlock)) {
-        readState = STATE_PROCESS_CMD;
-        processCommand();
-      }
-      else {
-        console.log('COMMAND CHECKSUM ERROR');
-      }
-      readBlock = null;
-    }
-    else if (readBlock.length > 5) {
-      readBlock = null;
-    }
-  };
+  // calculate the checksum on the provided command frame data
+  checksum (block, length) {
+    let checksum = block[0];
+    for (let i = 1; i < length; i++) checksum = ((checksum + block[i]) >> 8) + ((checksum + block[i]) & 0xff);
+    return checksum;
+  }
 
-
-  var readData = function readData(data) {
-    if (!readBlock) {
-      readBlock = data;
-    }
-    else {
-      // append byte to current block
-      readBlock = Buffer.concat([readBlock, data], readBlock.length + data.length);
-    }
-
-    // if we have enough data for a block then process
-    if (readBlock.length >= readDataLength) {
-      readState = STATE_PROCESS_DATA;
-      if (readDataCallback) {
-        readDataCallback(readBlock);
-      }
-      else {
-        resetCommandFrame();
-      }
-    }
-  };
-
-
-  // process a block
-  //function processBlock(block) {
-  var processCommand = function processCommand() {
+  async processCommandFrame (commandFrame) {
     switch (commandFrame.command) {
       // get status
-      case CMD_STATUS:
-      if (commandFrame.deviceId >= 0x31 && commandFrame.deviceId <= 0x38) {
-        getStatusCommand((commandFrame.deviceId & 0xf) - 1);
-      }
-      else {
-        resetCommandFrame();
-      }
+      case Commands.STATUS:
+      console.log('CMD_STATUS')
+      if (commandFrame.deviceId >= 0x31 && commandFrame.deviceId <= 0x38) await this.getStatusCommand(commandFrame.driveNumber);
       break;
 
       // read sector
-      case CMD_READ:
-      if (commandFrame.deviceId >= 0x31 && commandFrame.deviceId <= 0x38) {
-        readSectorCommand((commandFrame.deviceId & 0xf) - 1);
-      }
-      else {
-        resetCommandFrame();
-      }
+      case Commands.READ:
+      console.log('CMD_READ')
+      if (commandFrame.deviceId >= 0x31 && commandFrame.deviceId <= 0x38) await this.readSectorCommand(commandFrame);
       break;
 
       // write sector
-      case CMD_WRITE:
-      case CMD_WRITE_VERIFY:
-      if (commandFrame.deviceId >= 0x31 && commandFrame.deviceId <= 0x38) {
-        writeSectorCommand((commandFrame.deviceId & 0xf) - 1);
-      }
-      else {
-        resetCommandFrame();
-      }
+      case Commands.WRITE:
+      case Commands.WRITE_VERIFY:
+      console.log('CMD_WRITE or CMD_WRITE_VERIFY')
+      if (commandFrame.deviceId >= 0x31 && commandFrame.deviceId <= 0x38) return await this.writeSectorCommand(commandFrame);
       break;
 
       // format
-      case CMD_FORMAT:
-      if (commandFrame.deviceId >= 0x31 && commandFrame.deviceId <= 0x38) {
-        formatDriveCommand((commandFrame.deviceId & 0xf) - 1);
-      }
-      else {
-        resetCommandFrame();
-      }
+      case Commands.FORMAT:
+      console.log('CMD_FORMAT')
+      if (commandFrame.deviceId >= 0x31 && commandFrame.deviceId <= 0x38) this.formatDriveCommand(commandFrame);
       break;
 
       case 0:
-      resetCommandFrame();
+      console.log('CMD 0')
+      this.state = States.WAIT_CMD;
       break;
 
       default:
+      console.log('CMD DEFAULT')
       console.log('DROP ' + commandFrame.command.toString(16) + ' : ' + commandFrame.deviceId.toString(16));
-      resetCommandFrame();
     }
-  };
+    return States.WAIT_CMD;
+  }
 
+  async processSectorData (data, commandFrame) {
+    if (!this.drives[commandFrame.driveNumber - 1]) throw new Error(`Write sector failed, no drive ${commandFrame.driveNumber}.`);
+    this.drives[commandFrame.driveNumber - 1].putSector(commandFrame.sectorNumber, data.slice(0, commandFrame.sectorSize));
+    await this.writeBlocks([
+      { bytes: [Responses.ACK], delay: DELAY_GETSECTOR_ACK },
+      { bytes: [Responses.COMPLETE], delay: DELAY_GETSECTOR_COMPLETE }
+    ]);
+  }
 
-
-  var getStatusCommand = function getStatusCommand(deviceId) {
-    if (drives[deviceId]) {
-      var statusBytes = drives[deviceId].getStatusBytes();
-      startWriteBlock([
-        {bytes: [SIO_ACK], delay: DELAY_GETSECTOR_ACK},{bytes: [SIO_COMPLETE], delay: DELAY_GETSECTOR_COMPLETE},
-        {bytes: statusBytes, delay: DELAY_GETSECTOR_DATA},
-        {bytes: [checkSum(statusBytes, statusBytes.length)], delay: DELAY_GETSECTOR_DATA, wait: true}
-      ], function() {
-        resetCommandFrame();
-      });
-    }
-    else {
-      resetCommandFrame();
-    }
-  };
-
-
-  var readSectorCommand = function readSectorCommand(deviceId) {
-    if (drives[deviceId]) {
-      var sectorNumber = (commandFrame.aux2 << 8) + commandFrame.aux1;
-      var sectorData = drives[deviceId].getSector(sectorNumber);
-      var sum = checkSum(sectorData, sectorData.length);
-      startWriteBlock([
-        {bytes: [SIO_ACK], delay: DELAY_GETSECTOR_ACK, wait: true},{bytes: [SIO_COMPLETE], delay: DELAY_GETSECTOR_COMPLETE},
-        {bytes: sectorData, delay: DELAY_GETSECTOR_DATA},
-        {bytes: [sum], delay: DELAY_GETSECTOR_DATA}
-      ], function() {
-        resetCommandFrame();
-      });
-    }
-    else {
-      resetCommandFrame();
-    }
-  };
-
-
-  var writeSectorCommand = function writeSectorCommand(deviceId) {
-    if (drives[deviceId]) {
-      var writeDeviceId = deviceId;
-      var sectorNumber = (commandFrame.aux2 << 8) + commandFrame.aux1;
-      var sectorSize = drives[deviceId].getSectorSize(sectorNumber);
-
-      readDataCallback = function(data) {
-        readState = STATE_WAIT_CMD;
-        drives[writeDeviceId].putSector(sectorNumber, data.slice(0,sectorSize));
-        startWriteBlock([
-          {bytes: [SIO_ACK], delay: DELAY_GETSECTOR_ACK},
-          {bytes: [SIO_COMPLETE], delay: DELAY_GETSECTOR_COMPLETE}
-        ], function() {
-          resetCommandFrame();
-        });
-      };
-      readDataLength = sectorSize; // sector size
-      readState = STATE_READ_DATA;
-
-      startWriteBlock([
-        //{bytes: [SIO_COMPLETE], delay: DELAY_GETSECTOR_COMPLETE}
-        {bytes: [SIO_ACK], delay: DELAY_GETSECTOR_ACK}
+  // get drive status
+  async getStatusCommand (driveNumber) {
+    if (this.drives[driveNumber - 1]) {
+      let statusBytes = this.drives[driveNumber - 1].getStatusBytes();
+      await this.writeBlocks([
+        { bytes: [Responses.ACK], delay: DELAY_GETSECTOR_ACK },{ bytes: [Responses.COMPLETE], delay: DELAY_GETSECTOR_COMPLETE },
+        { bytes: statusBytes, delay: DELAY_GETSECTOR_DATA },
+        { bytes: [this.checksum(statusBytes, statusBytes.length)], delay: DELAY_GETSECTOR_DATA, wait: true }
       ]);
     }
-    else {
-      resetCommandFrame();
-    }
-  };
+  }
+
+  // read drive sector
+  async readSectorCommand (commandFrame) {
+    if (!this.drives[commandFrame.driveNumber - 1]) throw new Error(`Read sector failed, no drive ${commandFrame.driveNumber}.`);
+    let sectorNumber = (commandFrame.aux2 << 8) + commandFrame.aux1;
+    let sectorData = this.drives[commandFrame.driveNumber - 1].getSector(sectorNumber);
+    let sum = this.checksum(sectorData, sectorData.length);
+    await this.writeBlocks([
+      { bytes: [Responses.ACK], delay: DELAY_GETSECTOR_ACK, wait: true },{ bytes: [Responses.COMPLETE], delay: DELAY_GETSECTOR_COMPLETE * 100 },
+      { bytes: sectorData, delay: DELAY_GETSECTOR_DATA },
+      { bytes: [sum], delay: DELAY_GETSECTOR_DATA }
+    ]);
+  }
+
+  // write drive sector
+  async writeSectorCommand (commandFrame) {
+    let driveIndex = commandFrame.driveNumber - 1;
+    if (!this.drives[driveIndex]) throw new Error(`Write sector failed, no drive ${commandFrame.driveNumber}.`);
+    // create the command frame for sector write
+    this.writeSectorCommandFrame = commandFrame;
+    this.writeSectorCommandFrame.sectorNumber = (commandFrame.aux2 << 8) + commandFrame.aux1;
+    this.writeSectorCommandFrame.dataLength = this.drives[driveIndex].getSectorSize(this.writeSectorCommandFrame.sectorNumber);
+    // acknowledge
+    await this.writeBlocks([{ bytes: [Responses.ACK], delay: DELAY_GETSECTOR_ACK }]);
+    return States.WAIT_SECTOR_DATA;
+  }
 
 
-  var formatDriveCommand = function formatDriveCommand(deviceId) {
-    if (!drives[deviceId]) {
-      drives[deviceId] = diskImage();
-    }
+  async formatDriveCommand (commandFrame) {
+    let driveIndex = commandFrame.driveNumber - 1;
+    if (!this.drives[driveIndex]) throw new Error(`Format disk failed, no drive ${commandFrame.driveNumber}.`);
 
-    var sectorSize = drives[deviceId].getSectorSize();
-    var sectorCount = drives[deviceId].getSectorCount();
+    let sectorSize = this.drives[driveIndex].getSectorSize();
+    let sectorCount = this.drives[driveIndex].getSectorCount();
 
-    drives[deviceId].format(sectorSize, sectorCount);
+    this.drives[driveIndex].format(sectorSize, sectorCount);
 
-    var response = new Uint8Array(sectorSize);
+    let response = new Uint8Array(sectorSize);
     response.fill(0xff);
-    startWriteBlock([
-      {bytes: [SIO_ACK], delay: DELAY_GETSECTOR_ACK},{bytes: [SIO_COMPLETE], delay: DELAY_GETSECTOR_COMPLETE},
-      {bytes: response, delay: DELAY_GETSECTOR_DATA},
-      {bytes: [checkSum(response, response.length)], delay: DELAY_GETSECTOR_DATA, wait: true}
-    ], function() {
-      resetCommandFrame();
-    });
-  };
+    await this.writeBlocks([
+      { bytes: [Responses.ACK], delay: DELAY_GETSECTOR_ACK },{ bytes: [Responses.COMPLETE], delay: DELAY_GETSECTOR_COMPLETE },
+      { bytes: response, delay: DELAY_GETSECTOR_DATA },
+      { bytes: [this.checksum(response, response.length)], delay: DELAY_GETSECTOR_DATA, wait: true }
+    ]);
+  }
 
 
 
 
-
-  var startWriteBlock = function startWriteBlock(block, callback) {
-    if (writing) {
-      console.log('REJECT SERIAL WRITE');
-      return;
-    }
-    writing = true;
-    writeBlock(block, callback);
-  };
-
-
-  var writeBlock = function writeBlock(block, callback) {
-    var data = block.shift();
-    var writeDone = function() {
-      if (block.length) {
-        writeBlock(block, callback);
-      }
-      else {
-        writing = false;
-        if (callback) {
-          callback();
-        }
-      }
-    };
-
-    if (data.delay) {
-      waitUSec(getHRTime(), data.delay);
-    }
-    port.write(data.bytes, function() {
-      if (data.wait) {
-        port.drain(function() {
-          writeDone();
-        });
-      }
-    });
-
-    if (!data.wait) {
-      writeDone();
-    }
-  };
-
-
-  var waitUSec = function waitUSec(startHRTime, uSeconds) {
-    while (getHRTime() - startHRTime < uSeconds * 1000) {
-      (function(){})(); // noop
-    }
-  };
-
-
-  var getHRTime = function getHRTime() {
-    var hrTime = process.hrtime();
-    return hrTime[0] * 1000000000 + hrTime[1];
-  };
-
-
-  var bufferToCommandFrame = function bufferToCommandFrame(block) {
-    if (checkSum(block, 4) !== block[4]) {
-      return false;
-    }
-
-    commandFrame.deviceId = block[0];
-    commandFrame.command = block[1];
-    commandFrame.aux1 = block[2];
-    commandFrame.aux2 = block[3];
-    commandFrame.checksum = block[4];
-    return true;
-  };
-
-  // calculate the checksum on the provided command frame block
-  var checkSum = function checkSum(block, length) {
-    var checksum = block[0];
-    for (var i = 1; i < length; i++) {
-      checksum = ((checksum + block[i]) >> 8) + ((checksum + block[i]) & 0xff);
-    }
-    return checksum;
-  };
-
-  var resetCommandFrame = function resetCommandFrame() {
-    commandFrame.deviceId = null;
-    commandFrame.command = null;
-    commandFrame.aux1 = null;
-    commandFrame.aux2 = null;
-    commandFrame.checksum = null;
-    readState = STATE_WAIT_CMD;
-  };
-
-
-
-
-  app.loadDrive = function loadDrive(drive, imagePath) {
-    // CHANGE THIS TO THROW AN ERROR
-    if (drive + 1 > MAXIMUM_DRIVES || drive < 0) {
-      return ['Invalid drive number.'];
-    }
-
-    drives[drive] = DiskImage(imagePath);
-
-    return null;
-  };
-
-
-  app.getStatus = function() {
-    var status = {
-      drives: []
-    };
-
-    for (var i = 0; i < MAXIMUM_DRIVES; i++) {
+  // get status of drives
+  getStatus () {
+    let status = { drives: [] };
+    for (let i = 0; i < MAXIMUM_DRIVES; i++) {
       status.drives[i] = {};
-      if (drives[i]) {
-        status.drives[i].filename = drives[i].getImageFilename();
-        status.drives[i].sectorCount = drives[i].getSectorCount();
-        status.drives[i].sectorSize = drives[i].getSectorSize(status.drives[i].sectorCount); // boot sectors may be smaller so use last sector
-        status.drives[i].readOnly = drives[i].isReadOnly();
+      if (this.drives[i]) {
+        status.drives[i].filename = this.drives[i].getImageFilename();
+        status.drives[i].sectorCount = this.drives[i].getSectorCount();
+        status.drives[i].sectorSize = this.drives[i].getSectorSize(status.drives[i].sectorCount); // boot sectors may be smaller so use last sector
+        status.drives[i].readOnly = this.drives[i].isReadOnly();
       }
     }
-
     return status;
+  }
+
+  // load drive image
+  loadDrive (drive, imagePath) {
+    // CHANGE THIS TO THROW AN ERROR
+    if (drive + 1 > MAXIMUM_DRIVES || drive < 0) return ['Invalid drive number.'];
+    this.drives[drive] = DiskImage(imagePath);
+    return null;
+  }
+
+  exportImage (drive) {
+    if (drive + 1 > MAXIMUM_DRIVES || drive < 0) throw new Error('Invalid drive number.');
+    if (!this.drives[drive]) throw new Error('No drive image.');
+    return this.drives[drive].exportImage();
   };
 
 
-  app.exportImage = function(drive) {
-    if (drive + 1 > MAXIMUM_DRIVES || drive < 0) {
-      throw new Error('Invalid drive number.');
-    }
-
-    if (!drives[drive]) {
-      throw new Error('No drive image.');
-    }
-
-    return drives[drive].exportImage();
+  importImage (drive, image, filePath) {
+    if (drive + 1 > MAXIMUM_DRIVES || drive < 0) throw new Error('Invalid drive number.');
+    if (!this.drives[drive]) this.drives[drive] = DiskImage();
+    this.drives[drive].importImage(image, filePath);
   };
 
 
-  app.importImage = function(drive, image, filePath) {
-    if (drive + 1 > MAXIMUM_DRIVES || drive < 0) {
-      throw new Error('Invalid drive number.');
-    }
-
-    if (!drives[drive]) {
-      drives[drive] = DiskImage();
-    }
-
-    drives[drive].importImage(image, filePath);
+  saveImage (drive, filePath) {
+    if (drive + 1 > MAXIMUM_DRIVES || drive < 0) throw new Error('Invalid drive number.');
+    if (!this.drives[drive]) throw new Error('No drive image.');
+    this.drives[drive].saveImage(filePath);
   };
 
 
-  app.saveImage = function(drive, filePath) {
-    if (drive + 1 > MAXIMUM_DRIVES || drive < 0) {
-      throw new Error('Invalid drive number.');
-    }
-
-    if (!drives[drive]) {
-      throw new Error('No drive image.');
-    }
-
-    drives[drive].saveImage(filePath);
-  };
-
-
-  app.unloadImage = function(drive) {
-    if (drive + 1 > MAXIMUM_DRIVES || drive < 0) {
-      throw new Error('Invalid drive number.');
-    }
-    drives[drive].unloadImage(drive);
-    drives[drive] = null;
+  unloadImage (drive) {
+    if (drive + 1 > MAXIMUM_DRIVES || drive < 0) throw new Error('Invalid drive number.');
+    this.drives[drive].unloadImage(drive);
+    this.drives[drive] = null;
   };
 
 
 
-  return app;
+
+  // write SIO blocks
+  async writeBlocks (blocks) {
+    if (this.writing) throw new Error('SIO write failed, write is currently active.');
+    this.writing = true;
+    while (blocks.length) {
+      let block = blocks.shift();
+      // check if there is a delay before write
+      if (block.delay) this.waitUSec(this.getHRTime(), block.delay);
+      await this.writeBlock(block);
+    }
+    this.writing = false;
+  }
+
+  // write SIO block
+  writeBlock (block) {
+    return new Promise((resolve, reject) => {
+      this.port.write(block.bytes, () => {
+        // check if resolve should wait until port write is complete
+        if (block.wait) this.port.drain(() => { resolve(); });
+        else resolve();
+      });
+    });
+  }
+
+
+
+  // micro-second wait
+  waitUSec (startHRTime, uSeconds) {
+    while (this.getHRTime() - startHRTime < uSeconds * 1000) (function(){})(); // noop
+  }
+
+  // get high resolution time integer
+  getHRTime () {
+    let hrTime = process.hrtime();
+    return hrTime[0] * 1000000000 + hrTime[1];
+  }
+}
+
+
+module.exports = serialDevice => {
+  console.log(serialDevice)
+  return new SIO(serialDevice);
 }
